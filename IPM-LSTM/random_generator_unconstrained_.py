@@ -259,10 +259,10 @@ import os
 
 # ---------------------- Parameters ----------------------
 N = 10000        # number of problems
-n = 20          # number of variables
-num_ineq = 5
-num_eq = 5
-out_path = 'datasets/qp/QP_convex_20var_5eq_5ineq.mat'
+n = 90          # number of variables
+num_ineq = 0
+num_eq = 0
+out_path = 'datasets/qp/QP_convex_90var_0eq_0ineq.mat'
 os.makedirs(os.path.dirname(out_path), exist_ok=True)
 
 seed = 42
@@ -277,7 +277,7 @@ frac_negative = 0.3        # fraction of negative eigenvalues in nonconvex branc
 prob_convex = 1.0  # 1.0 = always convex
 
 # Box-bound scheme probabilities: ['lower','upper','both','partial','none']
-box_probs = [0, 0, 0, 0, 1]  # always 'both' in this config; change as desired
+box_probs = [0, 0, 1, 0, 0]  # always 'both' in this config; change as desired
 
 #box_probs = [0, 0, 1, 0] 
 
