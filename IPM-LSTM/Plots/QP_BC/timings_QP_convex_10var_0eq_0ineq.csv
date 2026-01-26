@@ -1,0 +1,5 @@
+solver,val_time_s,avg_iters,mat_name
+learned,1.4077748749987222,50.0,QP_convex_10var_0eq_0ineq
+ipopt,1.9288253784179688,8.991,QP_convex_10var_0eq_0ineq
+IPM-LSTM(1),1.167,50,QP_convex_10var_0eq_0ineq
+IPM-LSTM(2),22.903,1000,QP_convex_10var_0eq_0ineq

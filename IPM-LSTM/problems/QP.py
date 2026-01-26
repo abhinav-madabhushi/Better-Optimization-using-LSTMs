@@ -24,7 +24,7 @@ class QP(object):
         A: [batch_size, num_eq, num_var]
         b: [batch_size, num_eq, 1]
     """
-    def __init__(self, prob_type, learning_type, val_frac=0.0005, test_frac=0., device='cuda' if torch.cuda.is_available() else 'cpu', seed=17, **kwargs):
+    def __init__(self, prob_type, learning_type, val_frac=0.1000, test_frac=0.8000, device='cuda' if torch.cuda.is_available() else 'cpu', seed=17, **kwargs):
         super().__init__()
 
         self.device = device
@@ -36,6 +36,11 @@ class QP(object):
         self.prob_type = prob_type
         torch.manual_seed(self.seed)
 
+        def _prep_bound(b):
+            if not torch.is_tensor(b):
+                return b
+            return b if b.dim() == 3 else b.unsqueeze(-1)
+
         if prob_type == 'QP_RHS':
             file_path = kwargs['file_path']
             data = sio.loadmat(file_path)
@@ -45,38 +50,44 @@ class QP(object):
             self.test_size = self.data_size - self.train_size - self.val_size
 
             self.num_var = data['Q'].shape[1]
-            self.num_ineq = data['G'].shape[1]
-            self.num_eq = data['A'].shape[1]
-            self.num_lb = 0
-            self.num_ub = 0
+            self.num_ineq = data['G'].shape[1] if 'G' in data else 0
+            self.num_eq = data['A'].shape[1] if 'A' in data else 0
+            self.num_lb = data['lb'].shape[1] if 'lb' in data else 0
+            self.num_ub = data['ub'].shape[1] if 'ub' in data else 0
                         
             if learning_type == 'train':
                 self.Q = torch.tensor(data['Q'][:self.train_size], device=self.device).float()  # (train_size, num_var, num_var)
                 self.p = torch.tensor(data['p'][:self.train_size], device=self.device).float().unsqueeze(-1)  # (train_size, num_var, 1)
-                self.A = torch.tensor(data['A'][:self.train_size], device=self.device).float()  # (train_size, num_eq, num_var)
-                self.b = torch.tensor(data['b'][:self.train_size], device=self.device).float()  # (train_size, num_eq, 1)
-                self.G = torch.tensor(data['G'][:self.train_size], device=self.device).float()  # (train_size, num_ineq, num_var)
-                self.c = torch.tensor(data['c'], device=self.device).float()  # (train_size, num_ineq, 1)
-                self.lb = -torch.inf
-                self.ub = torch.inf
+                if self.num_eq != 0:
+                    self.A = torch.tensor(data['A'][:self.train_size], device=self.device).float()
+                    self.b = torch.tensor(data['b'][:self.train_size], device=self.device).float()
+                if self.num_ineq != 0:
+                    self.G = torch.tensor(data['G'][:self.train_size], device=self.device).float()
+                    self.c = torch.tensor(data['c'][:self.train_size], device=self.device).float()
+                self.lb = _prep_bound(torch.tensor(data['lb'][:self.train_size], device=self.device).float()) if self.num_lb != 0 else -torch.inf
+                self.ub = _prep_bound(torch.tensor(data['ub'][:self.train_size], device=self.device).float()) if self.num_ub != 0 else torch.inf
             elif learning_type == 'val':
-                self.Q = torch.tensor(data['Q'][:self.val_size], device=self.device).float()  # (train_size, num_var, num_var)
-                self.p = torch.tensor(data['p'][:self.val_size], device=self.device).float().unsqueeze(-1)  # (train_size, num_var, 1)
-                self.A = torch.tensor(data['A'][:self.val_size], device=self.device).float()  # (train_size, num_eq, num_var)
-                self.b = torch.tensor(data['b'][:self.val_size], device=self.device).float()  # (train_size, num_eq, 1)
-                self.G = torch.tensor(data['G'][:self.val_size], device=self.device).float()  # (train_size, num_ineq, num_var)
-                self.c = torch.tensor(data['c'], device=self.device).float()  # (train_size, num_ineq, 1)
-                self.lb = -torch.inf
-                self.ub = torch.inf
+                self.Q = torch.tensor(data['Q'][:self.val_size], device=self.device).float()
+                self.p = torch.tensor(data['p'][:self.val_size], device=self.device).float().unsqueeze(-1)
+                if self.num_eq != 0:
+                    self.A = torch.tensor(data['A'][:self.val_size], device=self.device).float()
+                    self.b = torch.tensor(data['b'][:self.val_size], device=self.device).float()
+                if self.num_ineq != 0:
+                    self.G = torch.tensor(data['G'][:self.val_size], device=self.device).float()
+                    self.c = torch.tensor(data['c'][:self.val_size], device=self.device).float()
+                self.lb = _prep_bound(torch.tensor(data['lb'][:self.val_size], device=self.device).float()) if self.num_lb != 0 else -torch.inf
+                self.ub = _prep_bound(torch.tensor(data['ub'][:self.val_size], device=self.device).float()) if self.num_ub != 0 else torch.inf
             elif learning_type == 'test':
-                self.Q = torch.tensor(data['Q'][:self.test_size], device=self.device).float()  # (train_size, num_var, num_var)
-                self.p = torch.tensor(data['p'][:self.test_size], device=self.device).float().unsqueeze(-1)  # (train_size, num_var, 1)
-                self.A = torch.tensor(data['A'][:self.test_size], device=self.device).float()  # (train_size, num_eq, num_var)
-                self.b = torch.tensor(data['b'][:self.test_size], device=self.device).float()  # (train_size, num_eq, 1)
-                self.G = torch.tensor(data['G'][:self.test_size], device=self.device).float()  # (train_size, num_ineq, num_var)
-                self.c = torch.tensor(data['c'], device=self.device).float() # (train_size, num_ineq, 1)
-                self.lb = -torch.inf
-                self.ub = torch.inf
+                self.Q = torch.tensor(data['Q'][:self.test_size], device=self.device).float()
+                self.p = torch.tensor(data['p'][:self.test_size], device=self.device).float().unsqueeze(-1)
+                if self.num_eq != 0:
+                    self.A = torch.tensor(data['A'][:self.test_size], device=self.device).float()
+                    self.b = torch.tensor(data['b'][:self.test_size], device=self.device).float()
+                if self.num_ineq != 0:
+                    self.G = torch.tensor(data['G'][:self.test_size], device=self.device).float()
+                    self.c = torch.tensor(data['c'][:self.test_size], device=self.device).float()
+                self.lb = _prep_bound(torch.tensor(data['lb'][:self.test_size], device=self.device).float()) if self.num_lb != 0 else -torch.inf
+                self.ub = _prep_bound(torch.tensor(data['ub'][:self.test_size], device=self.device).float()) if self.num_ub != 0 else torch.inf
 
         elif prob_type == 'QP':
             self.data_size = kwargs['data_size']
@@ -97,8 +108,8 @@ class QP(object):
                 self.b = 2 * torch.rand(size=(self.data_size, self.num_eq), device=device)[:self.train_size].unsqueeze(-1) - 1  # [-1, 1]
                 self.G = torch.normal(mean=0, std=1, size=(self.data_size, self.num_ineq, self.num_var), device=device)[:self.train_size]
                 self.c = torch.sum(torch.abs(torch.bmm(self.G, torch.pinverse(self.A))), dim=2).unsqueeze(-1)
-                self.lb = -torch.inf
-                self.ub = torch.inf
+                self.lb = torch.tensor(data['lb'], device=self.device).float()[:self.train_size] if self.num_lb != 0 else -torch.inf
+                self.ub = torch.tensor(data['ub'], device=self.device).float()[:self.train_size] if self.num_ub != 0 else torch.inf
             elif learning_type == 'val':
                 self.Q = torch.diag_embed(torch.rand(size=(self.data_size, self.num_var), device=device))[self.train_size:self.train_size + self.val_size]
                 self.p = torch.rand(size=(self.data_size, self.num_var), device=device)[self.train_size:self.train_size + self.val_size].unsqueeze(-1)
@@ -106,8 +117,8 @@ class QP(object):
                 self.b = 2 * torch.rand(size=(self.data_size, self.num_eq), device=device)[self.train_size:self.train_size + self.val_size].unsqueeze(-1) - 1  # [-1, 1]
                 self.G = torch.normal(mean=0, std=1, size=(self.data_size, self.num_ineq, self.num_var), device=device)[self.train_size:self.train_size + self.val_size]
                 self.c = torch.sum(torch.abs(torch.bmm(self.G, torch.pinverse(self.A))), dim=2).unsqueeze(-1)
-                self.lb = -torch.inf
-                self.ub = torch.inf
+                self.lb = torch.tensor(data['lb'], device=self.device).float()[self.train_size:self.train_size + self.val_size] if self.num_lb != 0 else -torch.inf
+                self.ub = torch.tensor(data['ub'], device=self.device).float()[self.train_size:self.train_size + self.val_size] if self.num_ub != 0 else torch.inf
             elif learning_type == 'test':
                 self.Q = torch.diag_embed(torch.rand(size=(self.data_size, self.num_var), device=device))[self.train_size + self.val_size:]
                 self.p = torch.rand(size=(self.data_size, self.num_var), device=device)[self.train_size + self.val_size:].unsqueeze(-1)
@@ -115,8 +126,8 @@ class QP(object):
                 self.b = 2 * torch.rand(size=(self.data_size, self.num_eq), device=device)[self.train_size + self.val_size:].unsqueeze(-1) - 1  # [-1, 1]
                 self.G = torch.normal(mean=0, std=1, size=(self.data_size, self.num_ineq, self.num_var), device=device)[self.train_size + self.val_size:]
                 self.c = torch.sum(torch.abs(torch.bmm(self.G, torch.pinverse(self.A))), dim=2).unsqueeze(-1)
-                self.lb = -torch.inf
-                self.ub = torch.inf
+                self.lb = torch.tensor(data['lb'], device=self.device).float()[self.train_size + self.val_size:] if self.num_lb != 0 else -torch.inf
+                self.ub = torch.tensor(data['ub'], device=self.device).float()[self.train_size + self.val_size:] if self.num_ub != 0 else torch.inf
         
 
         else:
@@ -267,12 +278,22 @@ class QP(object):
     def obj_fn(self, x, **kwargs):
         Q = kwargs.get('Q', self.Q)
         p = kwargs.get('p', self.p)
-        return 0.5 * torch.bmm(x.permute(0, 2, 1), torch.bmm(Q, x)) + torch.bmm(self.pt, x)
+        return 0.5 * torch.bmm(x.permute(0, 2, 1), torch.bmm(Q, x)) + torch.bmm(p.permute(0, 2, 1), x)
 
     def obj_grad(self, x, **kwargs):
         Q = kwargs.get('Q', self.Q)
         p = kwargs.get('p', self.p)
-        return torch.bmm(self.Q_sym, x) + p
+        # align batch size with x
+        B = x.shape[0]
+        if Q.shape[0] != B:
+            if Q.shape[0] == 1:
+                Q = Q.expand(B, -1, -1)
+                p = p.expand(B, -1, -1)
+            else:
+                Q = Q[:B]
+                p = p[:B]
+        Q_sym = 0.5 * (Q + Q.permute(0, 2, 1))
+        return torch.bmm(Q_sym, x) + p
 
     def ineq_resid(self, x, **kwargs):
         G = kwargs.get('G', self.G)
@@ -302,6 +323,118 @@ class QP(object):
         ub = kwargs.get('ub', self.ub)
         return torch.clamp(x-ub, 0)
 
+    # ---- simple residuals for training diagnostics ----
+    def primal_feasibility_basic(self, x, s=None, lb=None, ub=None, A=None, b=None, G=None, c=None):
+        """
+        Returns max violation across bounds/eq/ineq per batch element.
+        Shapes: x [B,n,1], s [B,m,1] (optional), lb/ub [B,n,1].
+        """
+        x_col = x if x.dim() == 3 else x.unsqueeze(-1)
+        B = x_col.shape[0]
+        lb = lb if lb is not None else self.lb
+        ub = ub if ub is not None else self.ub
+        A = A if A is not None else getattr(self, 'A', None)
+        b = b if b is not None else getattr(self, 'b', None)
+        G = G if G is not None else getattr(self, 'G', None)
+        c = c if c is not None else getattr(self, 'c', None)
+
+        residuals = []
+        if torch.is_tensor(lb) and torch.isfinite(lb).any():
+            lb_col = lb if lb.dim() == 3 else lb.unsqueeze(-1)
+            lb_col = lb_col.expand(B, -1, -1)
+            res_lb = torch.minimum(torch.zeros_like(x_col), x_col - lb_col)
+            residuals.append(res_lb)
+        if torch.is_tensor(ub) and torch.isfinite(ub).any():
+            ub_col = ub if ub.dim() == 3 else ub.unsqueeze(-1)
+            ub_col = ub_col.expand(B, -1, -1)
+            res_ub = torch.minimum(torch.zeros_like(x_col), ub_col - x_col)
+            residuals.append(res_ub)
+        if A is not None:
+            A_use = A if A.dim() == 3 else A.unsqueeze(0).expand(B, -1, -1)
+            b_use = b if b is None else (b if b.dim() == 3 else b.unsqueeze(-1))
+            if b_use is not None and b_use.shape[0] == 1 and B > 1:
+                b_use = b_use.expand(B, -1, -1)
+            res_eq = torch.bmm(A_use, x_col) - (b_use if b_use is not None else 0)
+            residuals.append(res_eq)
+        if G is not None:
+            G_use = G if G.dim() == 3 else G.unsqueeze(0).expand(B, -1, -1)
+            c_use = c if c is None else (c if c.dim() == 3 else c.unsqueeze(-1))
+            if c_use is not None and c_use.shape[0] == 1 and B > 1:
+                c_use = c_use.expand(B, -1, -1)
+            s_use = s if s is None else (s if s.dim() == 3 else s.unsqueeze(-1))
+            res_ineq = torch.bmm(G_use, x_col) - (c_use if c_use is not None else 0) - (s_use if s_use is not None else 0)
+            residuals.append(res_ineq)
+
+        if not residuals:
+            return torch.zeros(B, device=x_col.device, dtype=x_col.dtype)
+        all_res = torch.cat(residuals, dim=1)
+        return all_res.abs().amax(dim=(1, 2))
+
+    def dual_feasibility_basic(self, x, eta=None, lamb=None, zl=None, zu=None, lb=None, ub=None, G=None, A=None):
+        """
+        Stationarity residual of Lagrangian with box-dual variables zl, zu.
+        """
+        x_col = x if x.dim() == 3 else x.unsqueeze(-1)
+        B = x_col.shape[0]
+        lb = lb if lb is not None else self.lb
+        ub = ub if ub is not None else self.ub
+        G = G if G is not None else getattr(self, 'G', None)
+        A = A if A is not None else getattr(self, 'A', None)
+
+        res = self.obj_grad(x_col)
+        if A is not None and lamb is not None:
+            A_use = A if A.dim() == 3 else A.unsqueeze(0).expand(B, -1, -1)
+            lamb_col = lamb if lamb.dim() == 3 else lamb.unsqueeze(-1)
+            res = res + torch.bmm(A_use.transpose(1, 2), lamb_col)
+        if G is not None and eta is not None:
+            G_use = G if G.dim() == 3 else G.unsqueeze(0).expand(B, -1, -1)
+            eta_col = eta if eta.dim() == 3 else eta.unsqueeze(-1)
+            res = res + torch.bmm(G_use.transpose(1, 2), eta_col)
+        if zl is not None and torch.is_tensor(lb):
+            zl_col = zl if zl.dim() == 3 else zl.unsqueeze(-1)
+            res = res - zl_col
+        if zu is not None and torch.is_tensor(ub):
+            zu_col = zu if zu.dim() == 3 else zu.unsqueeze(-1)
+            res = res + zu_col
+        return res.abs().amax(dim=(1, 2))
+
+    def complementarity_basic(self, x, s=None, eta=None, zl=None, zu=None, lb=None, ub=None):
+        """
+        Complementarity for box bounds and optional inequality slack/dual.
+        """
+        x_col = x if x.dim() == 3 else x.unsqueeze(-1)
+        B = x_col.shape[0]
+        comps = []
+        if zl is not None and torch.is_tensor(lb):
+            lb_col = lb if lb.dim() == 3 else lb.unsqueeze(-1)
+            lb_col = lb_col.expand(B, -1, -1)
+            zl_col = zl if zl.dim() == 3 else zl.unsqueeze(-1)
+            comps.append(zl_col * (x_col - lb_col))
+        if zu is not None and torch.is_tensor(ub):
+            ub_col = ub if ub.dim() == 3 else ub.unsqueeze(-1)
+            ub_col = ub_col.expand(B, -1, -1)
+            zu_col = zu if zu.dim() == 3 else zu.unsqueeze(-1)
+            comps.append(zu_col * (ub_col - x_col))
+        if s is not None and eta is not None:
+            s_col = s if s.dim() == 3 else s.unsqueeze(-1)
+            eta_col = eta if eta.dim() == 3 else eta.unsqueeze(-1)
+            comps.append(s_col * eta_col)
+        if not comps:
+            return torch.zeros(B, device=x_col.device, dtype=x_col.dtype)
+        all_comp = torch.cat(comps, dim=1)
+        return all_comp.abs().amax(dim=(1, 2))
+
+    def primal_dual_infeasibility_basic(self, *args, **kwargs):
+        """
+        Convenience wrapper returning (eP, eD) using basic residuals.
+        """
+        # split kwargs for primal and dual
+        primal_kwargs = {k: v for k, v in kwargs.items() if k in {'s', 'lb', 'ub', 'A', 'b', 'G', 'c'}}
+        dual_kwargs = {k: v for k, v in kwargs.items() if k in {'eta', 'lamb', 'zl', 'zu', 'lb', 'ub', 'G', 'A'}}
+        eP = self.primal_feasibility_basic(args[0], **primal_kwargs)
+        eD = self.dual_feasibility_basic(args[0], **dual_kwargs)
+        return eP, eD
+
     def F0(self, x, eta, s, lamb, zl, zu, sigma, **kwargs):
         Q = kwargs.get('Q', self.Q)
         p = kwargs.get('p', self.p)
@@ -313,8 +446,40 @@ class QP(object):
             b = kwargs.get('b', self.b)
         if self.num_lb != 0:
             lb = kwargs.get('lb', self.lb)
+            if torch.is_tensor(lb):
+                if lb.dim() == 2:
+                    lb = lb.unsqueeze(-1)
+                if lb.shape[0] != batch_size:
+                    if lb.shape[0] == 1:
+                        lb = lb.expand(batch_size, -1, -1)
+                    elif lb.shape[0] == self.num_var:  # lb provided as [n,1] or [n]
+                        lb = lb.unsqueeze(0).expand(batch_size, -1, -1)
+                    else:
+                        lb = lb.expand(batch_size, -1, -1)
+                # align number of variables
+                if lb.shape[1] > x.shape[1]:
+                    lb = lb[:, :x.shape[1], :]
+                elif lb.shape[1] < x.shape[1]:
+                    pad = lb.new_zeros(batch_size, x.shape[1] - lb.shape[1], 1)
+                    lb = torch.cat([lb, pad], dim=1)
         if self.num_ub != 0:
             ub = kwargs.get('ub', self.ub)
+            if torch.is_tensor(ub):
+                if ub.dim() == 2:
+                    ub = ub.unsqueeze(-1)
+                if ub.shape[0] != batch_size:
+                    if ub.shape[0] == 1:
+                        ub = ub.expand(batch_size, -1, -1)
+                    elif ub.shape[0] == self.num_var:  # ub provided as [n,1] or [n]
+                        ub = ub.unsqueeze(0).expand(batch_size, -1, -1)
+                    else:
+                        ub = ub.expand(batch_size, -1, -1)
+                # align number of variables
+                if ub.shape[1] > x.shape[1]:
+                    ub = ub[:, :x.shape[1], :]
+                elif ub.shape[1] < x.shape[1]:
+                    pad = ub.new_zeros(batch_size, x.shape[1] - ub.shape[1], 1)
+                    ub = torch.cat([ub, pad], dim=1)
 
         # residual
         F_list = []
@@ -365,8 +530,37 @@ class QP(object):
         F: [batch_size, num_var+num_ineq+num_ineq+num_eq, 1]
         mu: [batch_size, 1, 1]
         """
+        def _col(t):
+            if t is None:
+                return None
+            return t if t.dim() == 3 else t.unsqueeze(-1)
+
+        def _align(t, batch_size, cols):
+            if t is None:
+                return None
+            t = _col(t)
+            if t.shape[0] == 1 and batch_size > 1:
+                t = t.expand(batch_size, -1, -1)
+            if cols is not None and t.shape[1] != cols:
+                if t.shape[1] > cols:
+                    t = t[:, :cols, :]
+                else:
+                    pad = t.new_zeros(batch_size, cols - t.shape[1], 1)
+                    t = torch.cat([t, pad], dim=1)
+            return t
+
         Q = kwargs.get('Q', self.Q)
         p = kwargs.get('p', self.p)
+        batch_size = Q.shape[0]
+
+        # normalize inputs
+        x    = _align(x, batch_size, self.num_var)
+        eta  = _align(eta, batch_size, self.num_ineq) if self.num_ineq != 0 else None
+        s    = _align(s, batch_size, self.num_ineq) if self.num_ineq != 0 else None
+        lamb = _align(lamb, batch_size, self.num_eq) if self.num_eq != 0 else None
+        zl   = _align(zl, batch_size, self.num_lb) if self.num_lb != 0 else None
+        zu   = _align(zu, batch_size, self.num_ub) if self.num_ub != 0 else None
+
         mu = 0
         if self.num_ineq != 0:
             G = kwargs.get('G', self.G)
@@ -377,11 +571,20 @@ class QP(object):
             b = kwargs.get('b', self.b)
         if self.num_lb != 0:
             lb = kwargs.get('lb', self.lb)
-            mu += sigma * ((zl * (x-lb)).sum(1).unsqueeze(-1))
+            lb = _align(lb, batch_size, self.num_var)
+            if zl is None:
+                zl = torch.zeros((batch_size, self.num_lb, 1), device=x.device, dtype=x.dtype)
+            else:
+                zl = _align(zl, batch_size, self.num_lb)
+            mu += sigma * ((zl * (x - lb)).sum(1).unsqueeze(-1))
         if self.num_ub != 0:
             ub = kwargs.get('ub', self.ub)
-            mu += sigma * ((zu * (ub-x)).sum(1).unsqueeze(-1))
-        batch_size = Q.shape[0]
+            ub = _align(ub, batch_size, self.num_var)
+            if zu is None:
+                zu = torch.zeros((batch_size, self.num_ub, 1), device=x.device, dtype=x.dtype)
+            else:
+                zu = _align(zu, batch_size, self.num_ub)
+            mu += sigma * ((zu * (ub - x)).sum(1).unsqueeze(-1))
         # mu
         mu = mu/(self.num_ineq+self.num_lb+self.num_ub)
 

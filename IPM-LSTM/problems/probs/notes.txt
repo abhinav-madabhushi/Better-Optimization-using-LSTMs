@@ -1,0 +1,17 @@
+- if training loop expects a fixed dimensional input??? - fixed
+- check what each of the text files are and what problems each of them signify - fixed
+- memory issue in Linux: need to give less problems
+- make sure CUTEST.py runs on Linux and main.py runs on windows - fixed
+- check the results of the shifted IPM
+- look into the quadratic approximation of the data that it is doing
+- test the convexQCQP model on convexCQP problems from cutest
+
+Things to talk about:
+- checked how IPM-LSTM is doing: doing very well for convex functions, almost similar to IPOPT in solution and much better time, but for nonconvex problems, it has pretty bad results, but when we warm start IPOPT using IPM-LSTM, it gives better time with same result
+- integrated cutest into the code, so a code file runs in Linux and returns the appropriate data, which is used in the code in windows. one small issue is that the Linux is not having enough memory to import all the cutest problems at once, it is only able to 5-6 because they are so big, so i need to load them in batches, and maybe eventually get GPU running or something
+- neural networks usually require lot of data, but cutest doesn't have those many problems. so we might have to train on various datasets and test on cutest. issue is our model are only trained on convex QCQP problems- haven't gotten any results yet because still writing some code to integrate cutest into IPM-LSTM, some dimension issues currently but ill look into it and fix it
+- to do: take certain convex QCQP problems from cutest and test the model on that, and then test gradient descent and newtons method on that as well
+- used the txt files from your code, but didn't get time to run it yet. will do that as well. 
+
+- next meeting
+- to do: take certain convex QCQP problems from cutest and test the model on that, and then test gradient descent and newtons method on that as well

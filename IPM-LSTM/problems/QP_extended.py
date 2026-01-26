@@ -24,7 +24,7 @@ class QP(object):
         A: [batch_size, num_eq, num_var]
         b: [batch_size, num_eq, 1]
     """
-    def __init__(self, prob_type, learning_type, val_frac=0.0001, test_frac=0.9000, device='cuda' if torch.cuda.is_available() else 'cpu', seed=17, **kwargs):
+    def __init__(self, prob_type, learning_type, val_frac=0.1000, test_frac=0.1000, device='cuda' if torch.cuda.is_available() else 'cpu', seed=17, **kwargs):
         super().__init__()
 
         self.device = device
@@ -35,6 +35,8 @@ class QP(object):
         self.test_frac = test_frac
         self.prob_type = prob_type
         torch.manual_seed(self.seed)
+        # lightweight cache for reusing repeated gradient evaluations within a step
+        self._grad_cache = {}
 
         if prob_type == 'QP_RHS':
             file_path = kwargs['file_path']
@@ -117,6 +119,7 @@ class QP(object):
                 self.c = torch.sum(torch.abs(torch.bmm(self.G, torch.pinverse(self.A))), dim=2).unsqueeze(-1)
                 self.lb = -torch.inf
                 self.ub = torch.inf
+
 
         else:
             file_path = kwargs['file_path']
@@ -236,6 +239,83 @@ class QP(object):
     def name(self):
         str = '{}_{}_{}_{}_{}'.format(self.prob_type, self.num_ineq, self.num_eq, self.num_lb, self.num_ub)
         return str
+
+    # ---- tiny gradient cache helpers to avoid recomputing unchanged gradients ----
+    def _tensor_signature(self, tensor):
+        if tensor is None:
+            return None
+        return (
+            tensor.data_ptr(),
+            tuple(tensor.shape),
+            tensor.dtype,
+            tensor.device,
+            getattr(tensor, "_version", None),
+        )
+
+    def _cache_lookup(self, cache, key, sig):
+        if cache is None:
+            return None
+        entry = cache.get(key)
+        if entry and entry["sig"] == sig:
+            return entry["value"]
+        return None
+
+    def _cache_store(self, cache, key, sig, value):
+        if cache is None:
+            return
+        cache[key] = {"sig": sig, "value": value}
+
+    def _get_At(self, A=None, batch_size=None):
+        """
+        Return A^T, reusing cached self.At when possible to avoid recomputing.
+        Supports both batched (3D) and shared (2D) A.
+        """
+        A_use = A if A is not None else getattr(self, "A", None)
+        if A_use is None:
+            return None
+        cached = getattr(self, "At", None)
+        if cached is not None and A is None:
+            return cached
+        if A_use.dim() == 3:
+            At = A_use.transpose(1, 2).contiguous()
+        else:
+            B = batch_size if batch_size is not None else (self.Q.shape[0] if hasattr(self, "Q") else None)
+            At = A_use.t().unsqueeze(0)
+            if B is not None and B != At.shape[0]:
+                At = At.expand(B, -1, -1)
+        if A is None:
+            self.At = At
+        return At
+
+    def _cached_obj_grad(self, x, cache):
+        cache = self._grad_cache if cache is None else cache
+        sig = self._tensor_signature(x)
+        cached = self._cache_lookup(cache, "obj_grad", sig)
+        if cached is not None:
+            return cached
+        grad = self.obj_grad(x)
+        self._cache_store(cache, "obj_grad", sig, grad)
+        return grad
+
+    def _cached_eq_resid(self, x, cache):
+        cache = self._grad_cache if cache is None else cache
+        sig = self._tensor_signature(x)
+        cached = self._cache_lookup(cache, "eq_resid", sig)
+        if cached is not None:
+            return cached
+        res = self.eq_resid(x)
+        self._cache_store(cache, "eq_resid", sig, res)
+        return res
+
+    def _cached_ineq_resid(self, x, cache):
+        cache = self._grad_cache if cache is None else cache
+        sig = self._tensor_signature(x)
+        cached = self._cache_lookup(cache, "ineq_resid", sig)
+        if cached is not None:
+            return cached
+        res = self.ineq_resid(x)
+        self._cache_store(cache, "ineq_resid", sig, res)
+        return res
     
     # def expand_all_matrices(self, target_batch):
     #     def _expand_if_needed(t, target_batch):
@@ -518,7 +598,7 @@ class QP(object):
         grad = torch.bmm(torch.bmm(J.permute(0, 2, 1), J), y) + torch.bmm(J.permute(0, 2, 1), F)
         return grad
 
-    def opt_solve(self, solver_type='ipopt_box_qp_extended', tol=1e-2, initial_y = None, init_mu=None, init_g=None, init_zl=None, init_zu=None):
+    def opt_solve(self, solver_type='ipopt_box_qp_extended', tol=1e-5, initial_y = None, init_mu=None, init_g=None, init_zl=None, init_zu=None):
         if solver_type == 'osqp':
             print('running osqp')
             Q, p = self.Q.detach().cpu().numpy(), self.p.detach().cpu().numpy()
@@ -719,6 +799,7 @@ class QP(object):
             Y = []
             iters = []
             total_time = 0.0
+            time_per_problem = []
 
             for i in range(Q.shape[0]):
                 # ---- initial point y0 ----
@@ -794,8 +875,8 @@ class QP(object):
                     tol=tol
                 )
 
-                nlp.add_option('tol', tol)
-                nlp.add_option('print_level', 5)
+                #nlp.add_option('tol', tol)
+                nlp.add_option('print_level', 1)
 
                 if init_mu is not None:
                     nlp.add_option('warm_start_init_point', 'yes')
@@ -829,17 +910,44 @@ class QP(object):
 
                 Y.append(y)
                 iters.append(nlp.iters)
-                total_time += (end_time - start_time)
+                elapsed = end_time - start_time
+                total_time += elapsed
+                time_per_problem.append(elapsed)
 
             sols = np.array(Y)
-            parallel_time = total_time / Q.shape[0]
+            parallel_time = np.array(time_per_problem)  # per-problem wall times
 
         else:
             raise NotImplementedError
         
         
-        
-        return sols, total_time, parallel_time, np.array(iters).mean()
+        # compute eP/eD for Ipopt solutions when available
+        if solver_type == 'ipopt_box_qp_extended':
+            device = self.Q.device
+            dtype = self.Q.dtype
+            x_sol = torch.tensor(sols, device=device, dtype=dtype)
+            # shape to [B,n,1] for consistency
+            #x_col = x_sol.unsqueeze(-1) if x_sol.dim() == 2 else x_sol
+            x_col = x_sol.squeeze(-1) if x_sol.dim() == 3 else x_sol
+            zeros_like_x = torch.zeros_like(x_col)
+            # muP = torch.ones((x_col.shape[0], 1), device=device, dtype=dtype)
+            # muB = torch.ones((x_col.shape[0], 1), device=device, dtype=dtype)
+            # muA = torch.ones((x_col.shape[0], 1), device=device, dtype=dtype)
+            # # E-variables: reuse current slack/dual placeholders as None
+            # eP, eD = self.primal_dual_infeasibility(
+            #     x_col, None,
+            #     None, None, None, None, None, None,
+            #     None, None, None, None, None, None, None, None, None, None,
+            #     muP, muB, muA,
+            # )
+            # eP = eP.detach().cpu().numpy()
+            # eD = eD.detach().cpu().numpy()
+            x1 = self.lower_bound_dist(x_col)                       # [B,n]
+            x2 = self.upper_bound_dist(x_col)                       # [B,n]
+            bc_coord = torch.maximum(x1, x2)                        # [B,n]
+            bc_violation = bc_coord.flatten(1).norm(p=2, dim=1)     # [B]
+
+        return sols, total_time, parallel_time, np.array(iters).mean(), bc_violation  #, eP, eD
     
     # def merit_M(self,
     #         x, x1, x2, s,       # add s1 and s2 if there are bounds for inequality
@@ -1572,12 +1680,12 @@ class QP(object):
             x, s,      
             y, v, z1, z2, w1, w2,    
             x1E, x2E, s1E, s2E, yE, vE, z1E, z2E, w1E, w2E, 
-            muP, muB, muA, bad_x1, bad_x2):  
+            muP, muB, muA, bad_x1, bad_x2, grad_cache=None):  
 
         B, device = x.shape[0], x.device
         n = self.num_var
         x = x.unsqueeze(-1) if x.dim()==2 else x        # [B,n,1]
-        grad_x = self.obj_grad(x)                       # [B,n,1]
+        grad_x = self._cached_obj_grad(x, grad_cache)   # [B,n,1]
 
         lb_vals = self.lb.expand(B, n)    # [B,n]
         ub_vals = self.ub.expand(B, n)    # [B,n] 
@@ -1724,8 +1832,7 @@ class QP(object):
 
             # Use π^V in grad_x coupling: -A^T π^V  (NOT -A^T v)
             piV = vE - re / muA
-            At = (self.A.transpose(1, 2) if self.A.dim()==3
-                  else self.A.t().unsqueeze(0).expand(B, -1, -1))
+            At = self._get_At(batch_size=B)
             grad_x = grad_x - torch.bmm(At, v)
         
         grad_x = grad_x - pi1z + pi2z
@@ -1737,6 +1844,132 @@ class QP(object):
         #     grad_x = grad_x - grad_x2
 
         return grad_x, grad_s, grad_y, grad_v, grad_z1, grad_z2, grad_w1
+
+    def raw_kkt_gradients(self,
+            x, s,
+            y, v, z1, z2, w1, w2,
+            x1E, x2E, s1E, s2E, yE, vE, z1E, z2E, w1E, w2E,
+            muP, muB, muA, bad_x1, bad_x2, grad_cache=None):
+        """
+        Unnormalized KKT-style gradients matching the F(v_P) block in the paper.
+        Returns gradients for (x, s, y, v, z1, z2, w1, w2).
+        """
+        B, n, device = x.shape[0], x.shape[1], x.device
+        def _col(t):
+            return None if t is None else (t if t.dim() == 3 else t.unsqueeze(-1))
+        def _zeros_like_opt(t):
+            return None if t is None else torch.zeros_like(t)
+
+        x  = _col(x)   # [B,n,1]
+        s  = _col(s)
+        y  = _col(y)
+        v  = _col(v)
+        z1 = _col(z1)
+        z2 = _col(z2)
+        w1 = _col(w1)
+        w2 = _col(w2)
+
+        x1E = torch.zeros_like(x) if x1E is None else (x1E if x1E.dim() == 3 else x1E.unsqueeze(-1))
+        x2E = torch.zeros_like(x) if x2E is None else (x2E if x2E.dim() == 3 else x2E.unsqueeze(-1))
+        s1E = (_zeros_like_opt(s) if s1E is None else (s1E if s1E.dim() == 3 else s1E.unsqueeze(-1)))
+        s2E = (_zeros_like_opt(s) if s2E is None else (s2E if s2E.dim() == 3 else s2E.unsqueeze(-1)))
+        if yE is None:
+            yE = torch.zeros((B, self.num_ineq, 1), device=device) if self.num_ineq > 0 else None
+        else:
+            yE = yE if yE.dim() == 3 else yE.unsqueeze(-1)
+        if vE is None:
+            vE = torch.zeros((B, self.num_eq, 1), device=device) if self.num_eq > 0 else None
+        else:
+            vE = vE if vE.dim() == 3 else vE.unsqueeze(-1)
+        z1E = z1E if z1E.dim() == 3 else z1E.unsqueeze(-1)
+        z2E = z2E if z2E.dim() == 3 else z2E.unsqueeze(-1)
+        def _zeros_like_w(opt_w, fallback):
+            if opt_w is not None:
+                return torch.zeros_like(opt_w)
+            if fallback is not None:
+                return torch.zeros_like(fallback)
+            return None
+
+        if w1E is None:
+            w1E = _zeros_like_w(w1, s)
+        else:
+            w1E = w1E if w1E.dim() == 3 else w1E.unsqueeze(-1)
+
+        if w2E is None:
+            w2E = _zeros_like_w(w2, s)
+        else:
+            w2E = w2E if w2E.dim() == 3 else w2E.unsqueeze(-1)
+
+        muP = muP if muP.dim() == 3 else muP.unsqueeze(-1)
+        muB = muB if muB.dim() == 3 else muB.unsqueeze(-1)
+        muA = muA if muA.dim() == 3 else muA.unsqueeze(-1)
+
+        lb_vals = self.lb.expand(B, n)
+        ub_vals = self.ub.expand(B, n)
+        mask_lb = torch.isfinite(lb_vals).unsqueeze(-1)
+        mask_ub = torch.isfinite(ub_vals).unsqueeze(-1)
+
+        # Stationarity for x: grad f - G^T y - A^T v - E_l^T z1 + E_u^T z2
+        grad_x = self._cached_obj_grad(x, grad_cache)
+        if self.num_ineq != 0:
+            Gt = (self.G.transpose(1, 2) if self.G.dim() == 3
+                  else self.G.t().unsqueeze(0).expand(B, -1, -1))
+            grad_x = grad_x - torch.bmm(Gt, y)
+        if self.num_eq != 0 and v is not None:
+            At = self._get_At(batch_size=B)
+            grad_x = grad_x - torch.bmm(At, v)
+        if self.num_lb != 0:
+            grad_x = grad_x - z1 * mask_lb
+        if self.num_ub != 0:
+            grad_x = grad_x + z2 * mask_ub
+
+        grad_s = grad_y = grad_v = grad_z1 = grad_z2 = grad_w1 = grad_w2 = None
+
+        # Inequality blocks: y, s, w1, w2
+        if self.num_ineq != 0:
+            s_col = s
+            rp = self._cached_ineq_resid(x, grad_cache) - s_col              # c(x) - s
+            grad_y = rp + muP * (y - yE)                 # c(x)-s + muP(y-yE)
+
+            # s-gradient: y - w1 + w2 (masked by bounds on s)
+            s_lb = getattr(self, 's_lb', torch.zeros_like(s_col))
+            mask_s_lb = torch.isfinite(s_lb)
+            s1 = torch.where(mask_s_lb, s_col - s_lb, torch.zeros_like(s_col))
+
+            s_ub_default = torch.full_like(s_col, float('inf'))
+            s_ub = getattr(self, 's_ub', s_ub_default)
+            mask_s_ub = torch.isfinite(s_ub)
+            s2 = torch.where(mask_s_ub, s_ub - s_col, torch.zeros_like(s_col))
+
+            grad_s = y.clone()
+            if w1 is not None:
+                grad_s = grad_s - w1 * mask_s_lb
+            if w2 is not None:
+                grad_s = grad_s + w2 * mask_s_ub
+
+            if w1 is not None:
+                grad_w1 = (w1 * s1) + muB * (w1 - w1E + s1 - s1E)
+                grad_w1 = grad_w1 * mask_s_lb
+            if w2 is not None:
+                grad_w2 = (w2 * s2) + muB * (w2 - w2E + s2E - s2)
+                grad_w2 = grad_w2 * mask_s_ub
+
+        # Equality block: v
+        if self.num_eq != 0 and v is not None:
+            re = self._cached_eq_resid(x, grad_cache)
+            grad_v = re + muP * (v - vE)
+
+        # Lower/upper bounds on x: z1, z2
+        if self.num_lb != 0:
+            x1 = torch.where(mask_lb, x - lb_vals.unsqueeze(-1), torch.zeros_like(x))
+            grad_z1 = (z1 * x1) + muB * (z1 - z1E + x1 - x1E)
+            grad_z1 = grad_z1 * mask_lb
+        if self.num_ub != 0:
+            x2 = torch.where(mask_ub, ub_vals.unsqueeze(-1) - x, torch.zeros_like(x))
+            grad_z2 = (z2 * x2) + muB * (z2 - z2E + x2E - x2)
+            grad_z2 = grad_z2 * mask_ub
+
+        return grad_x, grad_s, grad_y, grad_v, grad_z1, grad_z2, grad_w1, grad_w2
 
     
     def merit_hess_inv_M(self,
@@ -1948,7 +2181,7 @@ class QP(object):
             x, s,      
             y, v, z1, z2, w1, w2,    
             x1E, x2E, s1E, s2E, yE, vE, z1E, z2E, w1E, w2E, 
-            muP, muB, muA):
+            muP, muB, muA, grad_cache=None):
         B, n, device = x.shape[0], x.shape[1], x.device
         x = x.unsqueeze(-1) if x.dim()==2 else x
         muB = muB.unsqueeze(-1)
@@ -1959,11 +2192,11 @@ class QP(object):
 
         residuals = []
         if self.num_eq != 0:
-            res_eq = self.eq_resid(x)
+            res_eq = self._cached_eq_resid(x, grad_cache)
             residuals.append(res_eq)
 
         if self.num_ineq != 0:
-            c_x = self.ineq_resid(x)                  # [B, m_ineq, 1]
+            c_x = self._cached_ineq_resid(x, grad_cache)                  # [B, m_ineq, 1]
             s_slack = s.unsqueeze(-1) if s.dim()==2 else s
             residuals.append(c_x - s_slack)
             # s_neg = torch.minimum(s_slack, torch.zeros_like(s_slack))
@@ -2021,14 +2254,98 @@ class QP(object):
 
         all_res = torch.cat(residuals, dim=1)
 
-        return all_res.abs().amax(dim=(1,2)) 
+        # use L2 norm over all residual entries per batch element
+        return all_res.flatten(1).norm(p=2, dim=1)
+        #return all_res.abs().amax(dim=(1, 2))
+        # look into this
     # change primal feasability 
+
+    def primal_dual_infeasibility(self,
+            x, s,
+            y, v, z1, z2, w1, w2,
+            x1E, x2E, s1E, s2E, yE, vE, z1E, z2E, w1E, w2E,
+            muP, muB, muA):
+        # Shapes
+        B, n, device = x.shape[0], x.shape[1], x.device
+        x_col = x.unsqueeze(-1) if x.dim() == 2 else x         # [B,n,1]
+        lb_vals = self.lb.expand(B, n).to(device)              # [B,n]
+        ub_vals = self.ub.expand(B, n).to(device)              # [B,n]
+        mask_lb = torch.isfinite(lb_vals)                      # [B,n]
+        mask_ub = torch.isfinite(ub_vals)                      # [B,n]
+
+        # ---------- Primal infeasibility (bounds + equality) ----------
+        x_inf = x_col.abs().amax(dim=(1, 2), keepdim=True)             # [B,1,1]
+        scale_p = torch.maximum(torch.ones_like(x_inf), x_inf)         # max{1,||x||∞}
+
+        lb_term = torch.zeros_like(x_col)
+        if mask_lb.any():
+            lb_term = torch.where(
+                mask_lb.unsqueeze(-1),
+                torch.minimum(torch.zeros_like(x_col), x_col - lb_vals.unsqueeze(-1)),
+                lb_term,
+            ) / scale_p
+
+        ub_term = torch.zeros_like(x_col)
+        if mask_ub.any():
+            ub_term = torch.where(
+                mask_ub.unsqueeze(-1),
+                torch.minimum(torch.zeros_like(x_col), ub_vals.unsqueeze(-1) - x_col),
+                ub_term,
+            ) / scale_p
+
+        eq_term = None
+        if self.num_eq > 0 and self.A is not None:
+            A = self.A
+            if A.dim() == 2:
+                A = A.unsqueeze(0).expand(B, -1, -1)
+            b = self.b
+            if b.dim() == 2:
+                b = b.unsqueeze(-1)
+            b_exp = b.expand(B, -1, -1)
+            eq_res = torch.bmm(A, x_col) - b_exp                      # [B,m_eq,1]
+            eq_term = eq_res / scale_p
+
+        terms = [lb_term, ub_term]
+        if eq_term is not None:
+            terms.append(eq_term)
+        eP = torch.cat(terms, dim=1).abs().amax(dim=(1, 2))  # [B]
+
+        # ---------- Dual infeasibility (box + equality terms) ----------
+        grad_f = self._cached_obj_grad(x_col, None)                      # [B,n,1]
+        z1_col = z1.unsqueeze(-1) if z1 is not None and z1.dim() == 2 else z1  # [B,n,1]
+        z2_col = z2.unsqueeze(-1) if z2 is not None and z2.dim() == 2 else z2
+
+        grad_norm_inf = grad_f.abs().amax(dim=(1, 2), keepdim=True)
+        z1_norm_inf = z1_col.abs().amax(dim=(1, 2), keepdim=True) if z1_col is not None else torch.zeros_like(grad_norm_inf)
+        z2_norm_inf = z2_col.abs().amax(dim=(1, 2), keepdim=True) if z2_col is not None else torch.zeros_like(grad_norm_inf)
+
+        sigma = torch.maximum(torch.ones_like(grad_norm_inf),
+                              torch.maximum(grad_norm_inf,
+                                            torch.maximum(z1_norm_inf, z2_norm_inf)))
+
+        grad_block = grad_f
+        if self.num_eq > 0 and v is not None and self.A is not None:
+            v_col = v.unsqueeze(-1) if v.dim() == 2 else v
+            A = self.A
+            if A.dim() == 2:
+                A = A.unsqueeze(0).expand(B, -1, -1)
+            At = self._get_At(A, batch_size=B)
+            grad_block = grad_block - torch.bmm(At, v_col)
+        grad_block = grad_block - (z1_col if z1_col is not None else 0) + (z2_col if z2_col is not None else 0)
+        grad_block = grad_block / sigma
+        z1_block = z1_col * torch.minimum(torch.ones_like(x_col), x_col - lb_vals.unsqueeze(-1)) if z1_col is not None else torch.zeros_like(x_col)
+        z2_block = z2_col * torch.minimum(torch.ones_like(x_col), ub_vals.unsqueeze(-1) - x_col) if z2_col is not None else torch.zeros_like(x_col)
+
+        # TODO: add equality and inequality dual pieces here.
+
+        eD = torch.cat([grad_block.abs(), z1_block.abs(), z2_block.abs()], dim=1).amax(dim=(1, 2))  # [B]
+        return eP, eD
 
     def dual_feasibility(self,
             x, s,      
             y, v, z1, z2, w1, w2,    
             x1E, x2E, s1E, s2E, yE, vE, z1E, z2E, w1E, w2E, 
-            muP, muB, muA):
+            muP, muB, muA, grad_cache=None):
         B, n, device = x.shape[0], x.shape[1], x.device
         muB = muB.unsqueeze(-1)
         lb_vals = self.lb.expand(B, n)    # [B,n]
@@ -2041,10 +2358,10 @@ class QP(object):
         # ensure x is [B,n,1]
         x_ = x.unsqueeze(-1) if x.dim()==2 else x    # [B,n,1]
 
-        # 1) ∇f(x)
-        res = self.obj_grad(x_)                       # [B,n,1]
+        # 1) ∇f(x) (cached within a step to avoid duplicate work)
+        res = self._cached_obj_grad(x_, grad_cache)     # [B,n,1]
         grad_norm = res.view(B, -1).norm(p=2, dim=1)    # ‖∇f‖₂ per batch
-        print("g: ", grad_norm.mean().item())
+        #print("g: ", grad_norm.mean().item())
 
         zScale = torch.maximum(torch.ones_like(grad_norm), grad_norm)  # [B]
         zScale = zScale.view(B, 1, 1)                     # make it broadcastable
@@ -2056,9 +2373,9 @@ class QP(object):
             A = self.A
             if A.dim() == 2:                           # shared (m_eq, n) → broadcast to batch
                 A = A.unsqueeze(0).expand(B, -1, -1)
-            At = A.transpose(1, 2)  
+            At = self._get_At(A, batch_size=B)
             res = res - torch.bmm(At, v_)              # [B,n,1]
-            print("At: ", torch.bmm(At, v_).mean().item()  )
+            #print("At: ", torch.bmm(At, v_).mean().item()  )
 
         # 3) - Jc(x)^T y
         if self.num_ineq != 0:
@@ -2093,6 +2410,29 @@ class QP(object):
             res = res + torch.where(mask_ub, z2_,              # subtract z2_j if ub_j finite
                                     torch.zeros_like(z2_))
         #print("res: ", res.mean().item())
+
+        if self.num_ineq != 0:
+            # make sure shapes are [B,m,1]
+            y_  = y.unsqueeze(-1)  if y.dim()  == 2 else y
+            w1_ = w1.unsqueeze(-1) if (w1 is not None and w1.dim() == 2) else w1
+            w2_ = w2.unsqueeze(-1) if (w2 is not None and w2.dim() == 2) else w2
+
+            # default: only lower bound on s (or you represent only w1)
+            if w1_ is not None and w2_ is None:
+                rs = y_ - w1_                      # [B,m,1]
+            elif w1_ is not None and w2_ is not None:
+                rs = y_ - w1_ + w2_                # [B,m,1]
+            else:
+                # if you don't have w variables, you can still measure ||y|| as a fallback,
+                # but usually you *do* have w1 for s>=0.
+                rs = y_
+
+            rs_inf = rs.flatten(1).norm(p=2, dim=1)      # [B]
+        else:
+            rs_inf = torch.zeros(B, device=device, dtype=x_.dtype)
+
+        # ================== final dual infeasibility ==================
+
             
         res_scaled = res / zScale
 
@@ -2131,7 +2471,10 @@ class QP(object):
         # print(z1_[0])
         # print(z2_[0])
 
-        return res_scaled.abs().amax(dim=(1, 2))    # shape [B]
+        rx_l2 = res_scaled.flatten(1).norm(p=2, dim=1)  # [B]
+        return torch.maximum(rx_l2, rs_inf)
+
+    #return res_scaled.abs().amax(dim=(1, 2))    # shape [B]
 
 
     # def complementarity(self, x, x1, x2, s,       # add s1 and s2 if there are bounds for inequality
@@ -2318,7 +2661,8 @@ class QP(object):
             chi_tot  = torch.cat([chi_L, chi_U, chi_SW], dim=1) / zScale       # [B,≤2n,1]
         else:
             chi_tot  = torch.cat([chi_L, chi_U], dim=1) / zScale 
-        return chi_tot.abs().amax(dim=(1, 2))                      # [B]
+        #return chi_tot.abs().amax(dim=(1, 2))
+        return chi_tot.flatten(1).norm(p=2, dim=1)                 # [B]
 
 
     
@@ -2326,7 +2670,7 @@ class QP(object):
             x, s,      
             y, v, z1, z2, w1, w2,    
             x1E, x2E, s1E, s2E, yE, vE, z1E, z2E, w1E, w2E, 
-            muP, muB, muA):
+            muP, muB, muA, grad_cache=None):
         """
         Composite residual χ = χ_feas + χ_stny + χ_comp
           χ_feas(v) = max_i |c_i(x) - s_i|
@@ -2345,7 +2689,7 @@ class QP(object):
             x, s,      
             y, v, z1, z2, w1, w2,    
             x1E, x2E, s1E, s2E, yE, vE, z1E, z2E, w1E, w2E, 
-            muP, muB, muA)            # [B]
+            muP, muB, muA, grad_cache=grad_cache)            # [B]
         # complementarity
         C = self.complementarity(
             x, s,      
@@ -2359,7 +2703,7 @@ class QP(object):
             x, s,      
             y, v, z1, z2, w1, w2,    
             x1E, x2E, s1E, s2E, yE, vE, z1E, z2E, w1E, w2E, 
-            muP, muB, muA, M_max, bad_x1, bad_x2):
+            muP, muB, muA, M_max, bad_x1, bad_x2, raw_grads=None, grad_cache=None):
         """
         “M-iterate’’ consistency test – **box constraints only**.
 
@@ -2384,35 +2728,39 @@ class QP(object):
         x2     = torch.where(mask_ub, raw_x2,
                             torch.zeros_like(raw_x2)) 
 
-        grad_x, grad_s, grad_y, grad_v, grad_z1, grad_z2, grad_w1 = self.merit_grad_M(
-            x, s,       # add s1 and s2 if there are bounds for inequality
-            y, v, z1, z2, w1, w2,     # add w1 and w2 instead of w if there are bounds for inequality
-            x1E, x2E, s1E, s2E, yE, vE, z1E, z2E, w1E, w2E, # add w1E and w2E instead of wE if there are bounds for inequality
-            muP,
-            muB, muA, bad_x1, bad_x2
-        )
+        if raw_grads is None:
+            grad_x, grad_s, grad_y, grad_v, grad_z1, grad_z2, grad_w1, grad_w2 = self.raw_kkt_gradients(
+                x, s,       # add s1 and s2 if there are bounds for inequality
+                y, v, z1, z2, w1, w2,     # add w1 and w2 instead of w if there are bounds for inequality
+                x1E, x2E, s1E, s2E, yE, vE, z1E, z2E, w1E, w2E, # add w1E and w2E instead of wE if there are bounds for inequality
+                muP,
+                muB, muA, bad_x1, bad_x2, grad_cache
+            )
+        else:
+            grad_x, grad_s, grad_y, grad_v, grad_z1, grad_z2, grad_w1, grad_w2 = raw_grads
 
-        M_x = grad_x.abs().amax(dim=(1, 2))  # [B]
+        #M_x = grad_x.abs().amax(dim=(1, 2))  # [B]
 
-        #M_x = torch.linalg.vector_norm(grad_x, dim=2).mean(dim=1) 
+        M_x = torch.linalg.vector_norm(grad_x, dim=2).mean(dim=1) 
 
         eps = 1e-10
 
         # --- z1 (lower bounds) --------------------------------------------------
         DB1_diag = ((x1.squeeze(-1) + muB) / (z1.squeeze(-1) + muB)).abs().clamp_min(eps)  # D1^Z
         DB_norm_1 = DB1_diag.amax(dim=1)  # [B]
-        M_z1 = grad_z1.abs().amax(dim=(1, 2)) / DB_norm_1  # [B]
-        #M_z1 = torch.linalg.vector_norm(grad_z1, dim=2).mean(dim=1) / DB_norm_1 
+        #M_z1 = grad_z1.abs().amax(dim=(1, 2)) / DB_norm_1  # [B]
+        M_z1 = torch.linalg.vector_norm(grad_z1, dim=2).mean(dim=1) / DB_norm_1 
 
         # --- z2 (upper bounds) --------------------------------------------------
         DB2_diag = ((x2.squeeze(-1) + muB) / (z2.squeeze(-1) + muB)).abs().clamp_min(eps)  # D2^Z
         DB_norm_2 = DB2_diag.amax(dim=1)  # [B]
-        M_z2 = grad_z2.abs().amax(dim=(1, 2)) / DB_norm_2  # [B]
-        #M_z2 = torch.linalg.vector_norm(grad_z2, dim=2).mean(dim=1) / DB_norm_2
+        #M_z2 = grad_z2.abs().amax(dim=(1, 2)) / DB_norm_2  # [B]
+        M_z2 = torch.linalg.vector_norm(grad_z2, dim=2).mean(dim=1) / DB_norm_2
 
         # --- w1 (inequality lower-bound slack) ---------------------------------
         if self.num_ineq != 0 and w1 is not None:
-            M_s = grad_s.abs().amax(dim=(1, 2))  # [B]
+            #M_s = grad_s.abs().amax(dim=(1, 2))  # [B]
+            M_s = torch.linalg.vector_norm(grad_s, dim=2).mean(dim=1)
             s_  = s if s.dim()  == 3 else s.unsqueeze(-1)    # [B,m_ineq,1]
             w1_ = w1 if w1.dim() == 3 else w1.unsqueeze(-1)  # [B,m_ineq,1]
             # s1 = s - s_lb (defaults to 0)
@@ -2422,8 +2770,8 @@ class QP(object):
 
             DW1_diag = ((s1.squeeze(-1) + muB) / (w1_.squeeze(-1) + muB)).abs().clamp_min(eps)  # D1^W
             DW1_norm = DW1_diag.amax(dim=1)  # [B]
-            M_w1 = grad_w1.abs().amax(dim=(1, 2)) / DW1_norm
-            #M_w1 = torch.linalg.vector_norm(grad_w1, dim=2).mean(dim=1) / DW1_norm
+            #M_w1 = grad_w1.abs().amax(dim=(1, 2)) / DW1_norm
+            M_w1 = torch.linalg.vector_norm(grad_w1, dim=2).mean(dim=1) / DW1_norm
         else:
             M_w1 = torch.zeros_like(M_x)
             M_s = torch.zeros_like(M_x)
@@ -2431,16 +2779,16 @@ class QP(object):
         # --- y (inequality multipliers): scale by D_Y = μ^P I -------------------
         if self.num_ineq != 0 and grad_y is not None:
             DY_norm = muP.squeeze(-1).squeeze(-1).abs().clamp_min(eps)  # [B]
-            M_y = grad_y.abs().amax(dim=(1, 2)) / DY_norm
-            #M_y = torch.linalg.vector_norm(grad_y, dim=2).mean(dim=1) / DY_norm
+            #M_y = grad_y.abs().amax(dim=(1, 2)) / DY_norm
+            M_y = torch.linalg.vector_norm(grad_y, dim=2).mean(dim=1) / DY_norm
         else:
             M_y = torch.zeros_like(M_x)
 
         # --- v (equality multipliers): scale by D_A = μ^A I ---------------------
         if self.num_eq != 0 and grad_v is not None:
-            DA_norm = muA.squeeze(-1).squeeze(-1).abs().clamp_min(eps)  # [B]
-            M_v = grad_v.abs().amax(dim=(1, 2)) / DA_norm
-            #M_v = torch.linalg.vector_norm(grad_v, dim=2).mean(dim=1) / DA_norm
+            DA_norm = muP.squeeze(-1).squeeze(-1).abs().clamp_min(eps)  # [B]
+            #M_v = grad_v.abs().amax(dim=(1, 2)) / DA_norm
+            M_v = torch.linalg.vector_norm(grad_v, dim=2).mean(dim=1) / DA_norm
         else:
             M_v = torch.zeros_like(M_x)
 
@@ -2453,7 +2801,7 @@ class QP(object):
         #print(M_max.shape)
 
         denom = torch.maximum(torch.ones_like(fM0), fM0)       # max{1, |fM|}
-        return Mtest_value / denom                                    # [B]
+        return M_x, M_s, M_z1, M_z2, M_w1, M_y, M_v, Mtest_value / denom                                    # [B]
     
     def primal_dual_infeasibility_45(
         self,
@@ -2660,6 +3008,15 @@ class convex_ipopt(ipopt.Problem):
         if self.num_eq != 0:
             const_jacob.append(self.A.flatten())
         return np.concatenate(const_jacob)
+    
+    def hessianstructure(self):
+        # lower-triangular structure of Q (constraint Hessians are zero)
+        return self.tril_indices
+
+    def hessian(self, y, lagrange, obj_factor):
+        # exact Hessian of the Lagrangian: obj_factor * Q (constant)
+        H = obj_factor * 0.5 * (self.Q + self.Q.T)
+        return H[self.tril_indices]
 
     def intermediate(self, alg_mod, iter_count, obj_value,
             inf_pr, inf_du, mu, d_norm, regularization_size,
@@ -2770,10 +3127,10 @@ class ConstrainedQP(ipopt.Problem):
         super().__init__(n=n, m=m, lb=lb, ub=ub, cl=cl, cu=cu)
 
         # Ipopt options
-        self.add_option('tol', float(tol))
+        #self.add_option('tol', float(tol))
         self.add_option('max_iter', int(max_iter))
         self.add_option('print_level', int(print_level))
-        self.add_option('hessian_approximation', 'limited-memory')
+        #self.add_option('hessian_approximation', 'exact')
 
         # bookkeeping
         self.iters = 0
@@ -2838,6 +3195,21 @@ class ConstrainedQP(ipopt.Problem):
 
         rows, cols = np.indices((m, self.n))
         return rows.flatten().astype(int), cols.flatten().astype(int)
+    
+    def hessianstructure(self):
+        """
+        Lower-triangular structure of the constant Hessian of the Lagrangian (Q).
+        """
+        return np.tril_indices(self.n)
+
+    def hessian(self, x, lagrange, obj_factor):
+        """
+        Exact Hessian of the Lagrangian.
+        For quadratic objectives with linear constraints, this is just obj_factor * Q.
+        """
+        H = obj_factor * self.Q
+        tril = np.tril_indices(self.n)
+        return H[tril]
 
     def intermediate(self, alg_mod, iter_count, obj_value,
                      inf_pr, inf_du, mu, d_norm, regularization_size,
