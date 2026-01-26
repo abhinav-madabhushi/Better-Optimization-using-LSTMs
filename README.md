@@ -2,6 +2,11 @@ Guide
 - L20-LSTM-IPM_extended.py is the main file to run, the code for LSTM is in the models folder, and the QP class is in the problems folder.
 - Go to the "IPM-LSTM" folder before running any commands.
 
+Note: Due to size constraints, I was not able to push the 90-dimensional dataset to GitHub. To create it, will need to run the following command:
+
+```bash
+python random_generator_unconstrained_.py
+
 1) GPU Wall Clock for tables
 
 python testing_graphs.py \
