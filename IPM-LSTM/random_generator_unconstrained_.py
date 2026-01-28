@@ -253,19 +253,33 @@
 # )
 # print(f"Saved {out_path} with {N} mixed-type 2-var QPs.")
 
+import argparse
 import numpy as np
 import scipy.io as sio
 import os
 
 # ---------------------- Parameters ----------------------
-N = 10000        # number of problems
-n = 90          # number of variables
-num_ineq = 0
-num_eq = 0
-out_path = 'datasets/qp/QP_convex_90var_0eq_0ineq.mat'
+parser = argparse.ArgumentParser()
+parser.add_argument("--N", type=int, default=90, help="Number of problems to generate.")
+parser.add_argument("--n", type=int, default=10000, help="Number of variables.")
+parser.add_argument("--num_ineq", type=int, default=0, help="Number of inequality constraints.")
+parser.add_argument("--num_eq", type=int, default=0, help="Number of equality constraints.")
+parser.add_argument("--seed", type=int, default=42, help="Random seed.")
+parser.add_argument("--out_path", type=str, default=None, help="Optional custom output path (.mat). If not set, derived from N/n/eq/ineq.")
+args = parser.parse_args()
+
+N = args.N        # number of problems
+n = args.n        # number of variables
+num_ineq = args.num_ineq
+num_eq = args.num_eq
+
+if args.out_path:
+    out_path = args.out_path
+else:
+    out_path = f'datasets/qp/QP_convex_{N}prob_{n}var_{num_eq}eq_{num_ineq}ineq.mat'
 os.makedirs(os.path.dirname(out_path), exist_ok=True)
 
-seed = 42
+seed = args.seed
 rng = np.random.default_rng(seed)
 
 # Quadratic form spectrum ranges
