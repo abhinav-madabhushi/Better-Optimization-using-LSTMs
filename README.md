@@ -5,7 +5,7 @@ Guide
 Note: Due to size constraints, I was not able to push the 90-dimensional dataset to GitHub. To create it, will need to run the following command:
 
 ```bash
-python random_generator_unconstrained_.py
+python random_generator_unconstrained_.py --N 90 --n 10000
 ```
 
 1) GPU Wall Clock for tables
