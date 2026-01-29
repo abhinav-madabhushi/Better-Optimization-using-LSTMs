@@ -27,13 +27,13 @@ python L20-LSTM-IPM_extended.py \
   --mode model_comparison \
   --ckpt weights/weights_QP_BC_dim10_hiddensize32_numlayers1.pt \
   --compare_models weights/weights_QP_BC_dim10_hiddensize64_numlayers1.pt weights/weights_QP_BC_dim10_hiddensize128_numlayers1.pt \
- --mat_name QP_convex_10var_0eq_0ineq
+ --mat_name QP_convex_10var_0eq_0ineq --name hidden_size
 
 python L20-LSTM-IPM_extended.py \
   --mode model_comparison \
   --ckpt weights/weights_QP_BC_dim10_backprop1.pt \
   --compare_models weights/weights_QP_BC_dim10_backprop5.pt weights/weights_QP_BC_dim10_backprop10.pt \
- --mat_name QP_convex_10var_0eq_0ineq
+ --mat_name QP_convex_10var_0eq_0ineq --name backprop
 ```
 
 3) Performance Comparison with IPOPT Plots
